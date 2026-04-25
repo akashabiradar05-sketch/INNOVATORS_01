@@ -1,0 +1,331 @@
+#include <LiquidCrystal.h>
+
+LiquidCrystal lcd(12, 11, 10, 5, 4, 3, 2);
+
+const int backLight    = 13;
+const int buzzerPin    = 7;
+const int btnMorning   = 8;
+const int btnAfternoon = 9;
+const int btnEvening   = 6;
+const int btnNight     = A0;
+
+const bool ACTIVE_BUZZER = false;
+const bool PULLUP_MODE   = true;
+
+struct Dose {
+  const char* label;
+  int hour;
+  int minute;
+  bool taken;
+};
+
+Dose schedule[] = {
+  { "Morning",    8,  0,  false },
+  { "Afternoon", 13, 30,  false },
+  { "Evening",   18,  0,  false },
+  { "Night",     22,  0,  false },
+};
+const int TOTAL_DOSES = 4;
+const int btnPins[] = { btnMorning, btnAfternoon, btnEvening, btnNight };
+
+int  currentDose  = -1;
+bool alarmRinging = true;
+
+// Dem    o start time
+const int START_HOUR   = 8;
+const int START_MINUTE = 00;
+unsigned long bootMillis = 0;
+
+// ── Non-blocking buzzer pattern ──────────────────────────────
+// Pattern: BEEP 200ms, gap 100ms, BEEP 200ms, gap 100ms,
+//          BEEP 400ms, SILENCE 1500ms, repeat
+const int BEEP_FREQ = 1000;
+
+struct BeepStep {
+  bool  on;        // true = buzzer on, false = buzzer off
+  int   duration;  // ms
+};
+
+// 6-step pattern then silence
+BeepStep pattern[] = {
+  { true,  200 },   // beep 1
+  { false, 100 },   // gap
+  { true,  200 },   // beep 2
+  { false, 100 },   // gap
+  { true,  400 },   // beep 3 (longer)
+  { false, 1500 },  // silence before repeat
+};
+const int PATTERN_STEPS = 6;
+
+int  beepStep      = 0;
+unsigned long beepStepStart = 0;
+bool buzzerRunning = false;
+
+void startBuzzer() {
+  beepStep      = 0;
+  beepStepStart = millis();
+  buzzerRunning = true;
+
+  // Start first beep immediately
+  if (ACTIVE_BUZZER) digitalWrite(buzzerPin, HIGH);
+  else tone(buzzerPin, BEEP_FREQ);
+}
+
+void stopBuzzer() {
+  buzzerRunning = false;
+  beepStep      = 0;
+  if (ACTIVE_BUZZER) digitalWrite(buzzerPin, LOW);
+  else noTone(buzzerPin);
+}
+
+// Call this every loop() — handles beep pattern non-blocking
+void updateBuzzer() {
+  if (!buzzerRunning) return;
+
+  unsigned long now = millis();
+  if (now - beepStepStart >= (unsigned long)pattern[beepStep].duration) {
+    // Move to next step
+    beepStep = (beepStep + 1) % PATTERN_STEPS;
+    beepStepStart = now;
+
+    if (pattern[beepStep].on) {
+      if (ACTIVE_BUZZER) digitalWrite(buzzerPin, HIGH);
+      else tone(buzzerPin, BEEP_FREQ);
+    } else {
+      if (ACTIVE_BUZZER) digitalWrite(buzzerPin, LOW);
+      else noTone(buzzerPin);
+    }
+  }
+}
+
+// ── Simple blocking beeps only for feedback (short) ──────────
+void beep(int freq, int dur) {
+  if (ACTIVE_BUZZER) {
+    digitalWrite(buzzerPin, HIGH); delay(dur);
+    digitalWrite(buzzerPin, LOW);
+  } else {
+    tone(buzzerPin, freq, dur);
+    delay(dur + 20);
+    noTone(buzzerPin);
+  }
+}
+
+void successBeep() {
+  beep(900,  80); delay(40);
+  beep(1100, 80); delay(40);
+  beep(1400, 200);
+}
+
+// ── Clock ────────────────────────────────────────────────────
+void getCurrentTime(int &h, int &m) {
+  unsigned long elapsed = millis() - bootMillis;
+  int total = START_HOUR * 60 + START_MINUTE + (int)(elapsed / 60000UL);
+  h = (total / 60) % 24;
+  m =  total % 60;
+}
+
+// ── Screens ──────────────────────────────────────────────────
+void showMainScreen() {
+  int h, m;
+  getCurrentTime(h, m);
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  if (h < 10) lcd.print("0"); lcd.print(h);
+  lcd.print(":");
+  if (m < 10) lcd.print("0"); lcd.print(m);
+
+  int remaining = 0;
+  for (int i = 0; i < TOTAL_DOSES; i++)
+    if (!schedule[i].taken) remaining++;
+  lcd.print("  Left:"); lcd.print(remaining);
+
+  lcd.setCursor(0, 1);
+  if (remaining == 0) {
+    lcd.print("All doses done! ");
+  } else {
+    for (int i = 0; i < TOTAL_DOSES; i++) {
+      if (!schedule[i].taken) {
+        lcd.print("Next:");
+        lcd.print(schedule[i].label);
+        break;
+      }
+    }
+  }
+}
+
+void showAlarmScreen(int d) {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("!! ");
+  lcd.print(schedule[d].label);
+  lcd.print(" Time!!");
+  lcd.setCursor(0, 1);
+  lcd.print("Press BTN ");
+  lcd.print(d + 1);
+  lcd.print(" to stop");
+}
+
+void showTakenScreen(int d) {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("  Well Done!!   ");
+  lcd.setCursor(0, 1);
+  lcd.print(schedule[d].label);
+  lcd.print(" taken!  ");
+}
+
+void showWrongButton(int d) {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print(" Wrong button!  ");
+  lcd.setCursor(0, 1);
+  lcd.print("Need BTN ");
+  lcd.print(d + 1);
+  lcd.print("      ");
+}
+
+void showAlreadyTaken(int d) {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print(schedule[d].label);
+  lcd.print(" done!  ");
+  lcd.setCursor(0, 1);
+  lcd.print("Already logged. ");
+}
+
+// ── Debounce ─────────────────────────────────────────────────
+bool debounce(int pin) {
+  bool pressed = PULLUP_MODE
+                   ? digitalRead(pin) == LOW
+                   : digitalRead(pin) == HIGH;
+  if (pressed) {
+    delay(40);
+    bool still = PULLUP_MODE
+                   ? digitalRead(pin) == LOW
+                   : digitalRead(pin) == HIGH;
+    if (still) {
+      while (PULLUP_MODE
+               ? digitalRead(pin) == LOW
+               : digitalRead(pin) == HIGH);
+      delay(20);
+      return true;
+    }
+  }
+  return false;
+}
+
+// ── Start alarm ───────────────────────────────────────────────
+void startAlarm(int d) {
+  currentDose  = d;
+  alarmRinging = true;
+  showAlarmScreen(d);
+  startBuzzer();   // non-blocking start
+  Serial.print("ALARM: "); Serial.println(schedule[d].label);
+}
+
+// ── Stop alarm (correct button) ───────────────────────────────
+void stopAlarm(int d) {
+  schedule[d].taken = true;
+  alarmRinging      = false;
+  stopBuzzer();         // silence immediately
+  showTakenScreen(d);
+  successBeep();
+  Serial.print("TAKEN: "); Serial.println(schedule[d].label);
+  delay(2000);
+  showMainScreen();
+}
+
+// ── Setup ─────────────────────────────────────────────────────
+void setup() {
+  Serial.begin(9600);
+  Serial.println("=== PILL REMINDER ===");
+  Serial.println("Morning   alarm -> BTN 1 to stop");
+  Serial.println("Afternoon alarm -> BTN 2 to stop");
+  Serial.println("Evening   alarm -> BTN 3 to stop");
+  Serial.println("Night     alarm -> BTN 4 to stop");
+
+  pinMode(backLight, OUTPUT);
+  digitalWrite(backLight, HIGH);
+  pinMode(buzzerPin, OUTPUT);
+  digitalWrite(buzzerPin, LOW);
+
+  for (int i = 0; i < TOTAL_DOSES; i++)
+    pinMode(btnPins[i], PULLUP_MODE ? INPUT_PULLUP : INPUT);
+
+  bootMillis = millis();
+
+  lcd.begin(16, 2);
+  lcd.clear();
+  lcd.setCursor(0, 0); lcd.print(" Pill Reminder  ");
+  lcd.setCursor(0, 1); lcd.print("  Starting...   ");
+
+  // Startup beeps
+  beep(1000, 150); delay(80);
+  beep(1500, 150); delay(80);
+  beep(2000, 200);
+  delay(1500);
+
+  showMainScreen();
+}
+
+// ── Loop ──────────────────────────────────────────────────────
+void loop() {
+
+  // ── 1. Always update buzzer pattern first (non-blocking) ──
+  updateBuzzer();
+
+  int h, m;
+  getCurrentTime(h, m);
+
+  // ── 2. Check schedule ─────────────────────────────────────
+  if (!alarmRinging) {
+    for (int i = 0; i < TOTAL_DOSES; i++) {
+      if (!schedule[i].taken &&
+          h == schedule[i].hour &&
+          m == schedule[i].minute) {
+        startAlarm(i);
+        break;
+      }
+    }
+  }
+
+  // ── 3. Read buttons ───────────────────────────────────────
+  for (int i = 0; i < TOTAL_DOSES; i++) {
+    if (debounce(btnPins[i])) {
+      Serial.print("BTN"); Serial.print(i+1);
+      Serial.println(" pressed");
+
+      if (!alarmRinging) {
+        // No alarm — just show status
+        if (schedule[i].taken) {
+          showAlreadyTaken(i);
+          beep(400, 100);
+          delay(1500);
+          showMainScreen();
+        }
+
+      } else {
+        // Alarm ringing
+        if (i == currentDose) {
+          // ✅ Correct button — stop buzzer immediately
+          stopAlarm(i);
+        } else {
+          // ❌ Wrong button — warn but keep buzzing
+          showWrongButton(currentDose);
+          beep(300, 200);
+          delay(1200);
+          showAlarmScreen(currentDose);
+        }
+      }
+    }
+  }
+
+  // ── 4. Refresh screen every 30s when idle ─────────────────
+  static unsigned long lastRefresh = 0;
+  if (!alarmRinging && millis() - lastRefresh > 30000) {
+    showMainScreen();
+    lastRefresh = millis();
+  }
+
+  // NO delay() here — keeps loop fast for non-blocking buzzer
+}
